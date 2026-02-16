@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -5,11 +6,8 @@ from io import BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from PIL import Image
-import hashlib
-from datetime import datetime
-import sqlite3
-from openpyxl.drawing.image import Image as XLImage
 import random
+from database import *
 
 st.set_page_config(layout="wide", page_title="Workforce Analytics Dashboard")
 
@@ -21,9 +19,7 @@ bg_images = [
     "https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1600&q=80",
     "https://images.unsplash.com/photo-1496307042754-b4aa456c4a2d?auto=format&fit=crop&w=1600&q=80"
 ]
-
 bg_url = random.choice(bg_images)
-
 st.markdown(f"""
 <style>
 .stApp {{
@@ -45,82 +41,49 @@ background-color: #1f2937; padding:25px; border-radius:12px; text-align:center; 
 """, unsafe_allow_html=True)
 
 # ----------------------------
-# DATABASE
+# INITIALIZE DATABASE
 # ----------------------------
-conn = sqlite3.connect("workforce.db", check_same_thread=False)
-c = conn.cursor()
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    password TEXT,
-    role TEXT
-)
-""")
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT,
-    upload_date TEXT,
-    answered INTEGER,
-    dropped INTEGER,
-    aht REAL
-)
-""")
-conn.commit()
+create_tables()
 
 # ----------------------------
-# AUTH FUNCTIONS
+# SESSION STATE
 # ----------------------------
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def create_user(username,password,role):
-    try:
-        c.execute("INSERT INTO users VALUES (?,?,?)",(username,hash_password(password),role))
-        conn.commit()
-        return True
-    except:
-        return False
-
-def login_user(username,password):
-    c.execute("SELECT * FROM users WHERE username=? AND password=?",(username,hash_password(password)))
-    return c.fetchone()
-
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
 # ----------------------------
-# LOGIN / SIGNUP
+# LOGIN / PASSWORD RESET
 # ----------------------------
 if not st.session_state.logged_in:
     st.title("🔐 Workforce Analytics Platform")
-    menu = ["Login","Signup"]
-    choice = st.sidebar.selectbox("Menu",menu)
+    menu = ["Login", "Forgot Password"]
+    choice = st.sidebar.selectbox("Menu", menu)
 
-    if choice=="Signup":
+    if choice == "Login":
         user = st.text_input("Username")
-        pwd = st.text_input("Password",type="password")
-        role = st.selectbox("Role",["Admin","Manager"])
-        if st.button("Signup"):
-            if create_user(user,pwd,role):
-                st.success("Account Created")
-            else:
-                st.error("User already exists")
-
-    elif choice=="Login":
-        user = st.text_input("Username")
-        pwd = st.text_input("Password",type="password")
+        pwd = st.text_input("Password", type="password")
         if st.button("Login"):
-            result = login_user(user,pwd)
+            result = login_user(user, pwd)
             if result:
-                st.session_state.logged_in = True
-                st.session_state.username = result[0]
-                st.session_state.role = result[2]
-                st.rerun()
+                if result[3] != "Active":
+                    st.error("Your account is suspended. Contact manager.")
+                else:
+                    st.session_state.logged_in = True
+                    st.session_state.username = result[0]
+                    st.session_state.role = result[2]
+                    update_last_login(result[0])
+                    st.experimental_rerun()
             else:
                 st.error("Invalid credentials")
+
+    elif choice == "Forgot Password":
+        user = st.text_input("Enter your username")
+        new_pwd = st.text_input("New password", type="password")
+        if st.button("Reset Password"):
+            if reset_password(user, new_pwd):
+                st.success("Password updated successfully")
+            else:
+                st.error("User not found")
 
 # ----------------------------
 # DASHBOARD
@@ -131,125 +94,93 @@ if st.session_state.logged_in:
     st.sidebar.write(f"Role: {st.session_state.role}")
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
-        st.rerun()
+        st.experimental_rerun()
 
     # ----------------------------
-    # Admin can upload
+    # MANAGER: ADMIN MANAGEMENT
     # ----------------------------
-    uploaded_file = None
-    if st.session_state.role == "Admin":
-        uploaded_file = st.file_uploader("Upload Excel Report", type=["xlsx"])
+    if st.session_state.role == "Manager":
+        st.subheader("Manager Controls - Admin Management")
+        st.markdown("### Add Admin")
+        new_admin = st.text_input("Admin Username")
+        new_pwd = st.text_input("Admin Password", type="password")
+        if st.button("Create Admin"):
+            if create_user(new_admin, new_pwd, "Admin", created_by=st.session_state.username):
+                st.success(f"Admin {new_admin} created")
+                st.experimental_rerun()
+            else:
+                st.error("Admin already exists")
 
-    # ----------------------------
-    # Admin upload processing
-    # ----------------------------
-    if uploaded_file and st.session_state.role=="Admin":
-        df = pd.read_excel(uploaded_file)
-        df.columns = df.columns.str.strip().str.lower()
-        if "date" not in df.columns or "status" not in df.columns:
-            st.error("Excel must contain 'Date' and 'Status'")
-            st.stop()
-
-        df["date"] = pd.to_datetime(df["date"],errors="coerce")
-        df = df.dropna(subset=["date"])
-
-        # Detect AHT column
-        aht_column = None
-        for col in df.columns:
-            if "aht" in col or "handle" in col:
-                aht_column = col
-                break
-
-        answered = df[df["status"].str.lower()=="answered"].shape[0]
-        dropped = df[df["status"].str.lower()=="unanswered"].shape[0]
-        avg_aht = df[aht_column].mean() if aht_column else 0
-
-        # Save to DB
-        c.execute("""
-        INSERT INTO reports (username, upload_date, answered, dropped, aht)
-        VALUES (?,?,?,?,?)
-        """,(st.session_state.username,datetime.now().strftime("%Y-%m-%d"),answered,dropped,avg_aht))
-        conn.commit()
-        st.success("Report processed and saved!")
-
-    # ----------------------------
-    # Fetch reports from DB for Admin or Manager
-    # ----------------------------
-    reports_df = pd.read_sql_query("SELECT * FROM reports", conn)
-    if reports_df.empty:
-        st.info("No reports available yet.")
-    else:
-        # Admin sees everything + select report to download
-        if st.session_state.role=="Admin":
-            st.subheader("Uploaded Reports (Admin View)")
-            st.dataframe(reports_df)
-            selected_id = st.selectbox("Select Report ID to view/download", reports_df["id"])
+        st.markdown("### Remove Admin")
+        admins = get_admins()
+        admin_usernames = [a[0] for a in admins]
+        if admin_usernames:
+            to_remove = st.selectbox("Select admin to remove", admin_usernames)
+            if st.button("Remove Admin"):
+                if remove_admin(to_remove, st.session_state.username):
+                    st.success(f"Admin {to_remove} removed")
+                    st.experimental_rerun()
+                else:
+                    st.error("Cannot remove Admin with reports uploaded")
         else:
-            # Manager view only
-            st.subheader("Available Reports (Manager View)")
+            st.info("No admins found")
+
+    # ----------------------------
+    # ADMIN: REPORT UPLOAD
+    # ----------------------------
+    if st.session_state.role == "Admin":
+        st.subheader("Upload Excel Report")
+        uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
+        if uploaded_file:
+            df = pd.read_excel(uploaded_file)
+            df.columns = df.columns.str.strip().str.lower()
+            if "date" not in df.columns or "status" not in df.columns:
+                st.error("Excel must contain 'Date' and 'Status'")
+                st.stop()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            aht_column = None
+            for col in df.columns:
+                if "aht" in col or "handle" in col:
+                    aht_column = col
+                    break
+            answered = df[df["status"].str.lower() == "answered"].shape[0]
+            dropped = df[df["status"].str.lower() == "unanswered"].shape[0]
+            avg_aht = df[aht_column].mean() if aht_column else 0
+
+            # Save to DB
+            save_report(st.session_state.username, answered, dropped, avg_aht)
+            st.success("Report processed and saved!")
+
+            # ----------------------------
+            # KPI Cards
+            # ----------------------------
+            st.subheader("Report Summary")
+            col1, col2, col3 = st.columns(3)
+            col1.markdown(f"<div class='kpi-card'><h3>Answered</h3><h2>{answered}</h2></div>", unsafe_allow_html=True)
+            col2.markdown(f"<div class='kpi-card'><h3>Dropped</h3><h2>{dropped}</h2></div>", unsafe_allow_html=True)
+            col3.markdown(f"<div class='kpi-card'><h3>Average AHT</h3><h2>{round(avg_aht,2)}</h2></div>", unsafe_allow_html=True)
+
+            # Pie chart
+            fig1, ax1 = plt.subplots()
+            ax1.pie([answered, dropped], labels=["Answered","Dropped"], autopct="%1.1f%%", colors=['#16a34a','#dc2626'])
+            ax1.axis("equal")
+            st.pyplot(fig1)
+
+            # Histogram
+            st.subheader("Status Histogram")
+            df['status'].value_counts().plot(kind='bar', color=['#16a34a','#dc2626'])
+            st.pyplot(plt.gcf())
+
+    # ----------------------------
+    # VIEW REPORTS (All Roles)
+    # ----------------------------
+    st.subheader("Reports Overview")
+    reports_df = get_reports()
+    if reports_df.empty:
+        st.info("No reports yet")
+    else:
+        if st.session_state.role == "Admin":
+            st.dataframe(reports_df)
+        else:
             st.dataframe(reports_df[["id","username","upload_date","answered","dropped","aht"]])
-            selected_id = st.selectbox("Select Report ID to view/download", reports_df["id"])
-
-        report = reports_df[reports_df["id"] == selected_id].iloc[0]
-
-        st.markdown(f"**User:** {report['username']} | **Upload Date:** {report['upload_date']}")
-        st.markdown(f"**Answered:** {report['answered']} | **Dropped:** {report['dropped']} | **AHT:** {report['aht']}")
-
-        # KPI cards
-        col1,col2,col3,col4 = st.columns(4)
-        col1.markdown(f"<div class='kpi-card'><h3>Total Answered</h3><h2>{report['answered']}</h2></div>",unsafe_allow_html=True)
-        col2.markdown(f"<div class='kpi-card'><h3>Total Dropped</h3><h2>{report['dropped']}</h2></div>",unsafe_allow_html=True)
-        col3.markdown(f"<div class='kpi-card'><h3>Average AHT</h3><h2>{round(report['aht'],2)}</h2></div>",unsafe_allow_html=True)
-        col4.markdown(f"<div class='kpi-card'><h3>Answer Rate</h3><h2>{round((report['answered']/(report['answered']+report['dropped']))*100,2) if (report['answered']+report['dropped'])>0 else 0}%</h2></div>",unsafe_allow_html=True)
-
-        # Pie chart
-        st.subheader("Call Status Distribution")
-        pie_data = [report['answered'], report['dropped']]
-        labels = ["Answered","Dropped"]
-        colors = ['#16a34a','#dc2626']
-        fig2, ax2 = plt.subplots()
-        ax2.pie(pie_data, labels=labels, autopct='%1.1f%%', startangle=90, colors=colors)
-        ax2.axis('equal')
-        st.pyplot(fig2)
-
-        # Excel download
-        summary_df = pd.DataFrame({"Metric":["Total Answered","Total Dropped","Average AHT"],
-                                   "Value":[report['answered'],report['dropped'],report['aht']]})
-
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            summary_df.to_excel(writer, sheet_name="KPI Summary", index=False)
-        excel_buffer.seek(0)
-        st.download_button("📥 Download Excel Report", excel_buffer.getvalue(),
-                           f"Executive_Workforce_Report_{report['username']}.xlsx")
-
-        # PDF download
-        def generate_pdf_report():
-            buffer = BytesIO()
-            c = canvas.Canvas(buffer, pagesize=letter)
-            width,height = letter
-            y = height-40
-            c.setFont("Helvetica-Bold",16)
-            c.drawString(50,y,"Workforce Executive Report")
-            y -= 30
-            c.setFont("Helvetica",12)
-            c.drawString(50,y,f"Total Answered: {report['answered']}")
-            y -= 20
-            c.drawString(50,y,f"Total Dropped: {report['dropped']}")
-            y -= 20
-            c.drawString(50,y,f"Average AHT: {round(report['aht'],2)}")
-            y -= 40
-
-            pie_img_pdf = BytesIO()
-            fig2.savefig(pie_img_pdf, format='png')
-            pie_img_pdf.seek(0)
-            pil_img = Image.open(pie_img_pdf)
-
-            c.drawInlineImage(pil_img,50,y-200,width=200,height=200)
-
-            c.save()
-            buffer.seek(0)
-            return buffer
-
-        st.download_button("📄 Download PDF Report", generate_pdf_report(),
-                           f"Executive_Workforce_Report_{report['username']}.pdf",mime="application/pdf")
