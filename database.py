@@ -1,42 +1,43 @@
-# database.py
 import sqlite3
-import bcrypt
-import pandas as pd
+import hashlib
 from datetime import datetime
 
-DB_NAME = "workforce.db"
+DB_PATH = "workforce.db"
 
-# ----------------------------0
-# DATABASE CONNECTION
+# ----------------------------
+# CONNECTION
 # ----------------------------
 def get_connection():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    return conn
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 # ----------------------------
-# UTILITY FUNCTIONS
+# INITIALIZE DATABASE
 # ----------------------------
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+def init_db():
+    create_tables()
+    create_default_manager()
 
 # ----------------------------
-# TABLE CREATION
+# CREATE TABLES
 # ----------------------------
 def create_tables():
     conn = get_connection()
     c = conn.cursor()
-    # Users table
+
+    # USERS
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
             password TEXT,
             role TEXT,
-            status TEXT DEFAULT 'Active',
+            created_by TEXT,
             last_login TEXT,
-            created_by TEXT
+            status TEXT
         )
     """)
-    # Reports table
+
+    # REPORTS
     c.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,107 +48,191 @@ def create_tables():
             aht REAL
         )
     """)
-    # Audit log
+
+    # LOGS
     c.execute("""
-        CREATE TABLE IF NOT EXISTS audit_log (
+        CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
             action TEXT,
-            performed_by TEXT,
             timestamp TEXT
         )
     """)
+
     conn.commit()
     conn.close()
 
 # ----------------------------
-# AUDIT LOG
+# PASSWORD HASHING
 # ----------------------------
-def log_action(action, user):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("INSERT INTO audit_log (action, performed_by, timestamp) VALUES (?,?,?)",
-              (action, user, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
 # ----------------------------
-# USERS
+# DEFAULT MANAGER
 # ----------------------------
-def create_user(username, password, role, created_by=None):
+def create_default_manager():
     conn = get_connection()
     c = conn.cursor()
-    try:
-        c.execute("INSERT INTO users (username, password, role, created_by) VALUES (?,?,?,?)",
-                  (username, hash_password(password), role, created_by))
+
+    c.execute("SELECT * FROM users WHERE role='Manager'")
+    if not c.fetchone():
+        c.execute("""
+            INSERT INTO users (username, password, role, created_by, status, last_login)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            "manager",
+            hash_password("manager123"),
+            "Manager",
+            "System",
+            "Active",
+            None
+        ))
         conn.commit()
-        if created_by:
-            log_action(f"Created {role}: {username}", created_by)
+
+    conn.close()
+
+# ----------------------------
+# CREATE USER
+# ----------------------------
+def create_user(username, password, role, created_by):
+    conn = get_connection()
+    c = conn.cursor()
+
+    try:
+        c.execute("""
+            INSERT INTO users (username, password, role, created_by, status, last_login)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            username,
+            hash_password(password),
+            role,
+            created_by,
+            "Active",
+            None
+        ))
+        conn.commit()
         return True
-    except:
+    except sqlite3.IntegrityError:
         return False
     finally:
         conn.close()
 
+# ----------------------------
+# LOGIN
+# ----------------------------
 def login_user(username, password):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, hash_password(password)))
-    result = c.fetchone()
-    conn.close()
-    return result
 
-def update_last_login(username):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("UPDATE users SET last_login=? WHERE username=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), username))
-    conn.commit()
-    log_action("Logged in", username)
-    conn.close()
-
-def reset_password(username, new_password):
-    conn = get_connection()
-    c = conn.cursor()
     c.execute("SELECT * FROM users WHERE username=?", (username,))
-    if c.fetchone():
-        c.execute("UPDATE users SET password=? WHERE username=?", (hash_password(new_password), username))
-        conn.commit()
-        log_action("Password reset", username)
-        conn.close()
-        return True
-    conn.close()
-    return False
+    user = c.fetchone()
 
+    if user:
+        id_, uname, db_password, role, created_by, last_login, status = user
+
+        if status != "Active":
+            conn.close()
+            return None
+
+        if db_password == hash_password(password):
+            c.execute(
+                "UPDATE users SET last_login=? WHERE id=?",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), id_)
+            )
+            conn.commit()
+            conn.close()
+            return user
+
+    conn.close()
+    return None
+
+# ----------------------------
+# ADMIN MANAGEMENT
+# ----------------------------
 def get_admins():
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT username, status, last_login FROM users WHERE role='Admin'")
+    c.execute("SELECT * FROM users WHERE role='Admin'")
     admins = c.fetchall()
     conn.close()
     return admins
 
-def remove_admin(admin_username, manager_username):
+def suspend_admin(admin_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM reports WHERE username=?", (admin_username,))
-    if c.fetchone():
-        conn.close()
-        return False
-    c.execute("DELETE FROM users WHERE username=?", (admin_username,))
+    c.execute("UPDATE users SET status='Suspended' WHERE id=?", (admin_id,))
     conn.commit()
-    log_action(f"Removed Admin: {admin_username}", manager_username)
+    conn.close()
+
+def activate_admin(admin_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE users SET status='Active' WHERE id=?", (admin_id,))
+    conn.commit()
+    conn.close()
+
+def delete_admin(admin_id):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE id=?", (admin_id,))
+    conn.commit()
     conn.close()
     return True
 
-def get_reports():
+# ----------------------------
+# RESET PASSWORD
+# ----------------------------
+def reset_password(username, new_password):
     conn = get_connection()
-    df = pd.read_sql_query("SELECT * FROM reports", conn)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET password=? WHERE username=?",
+        (hash_password(new_password), username)
+    )
+    conn.commit()
     conn.close()
-    return df
 
+# ----------------------------
+# LOG ACTION
+# ----------------------------
+def log_action(username, action):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO logs (username, action, timestamp)
+        VALUES (?, ?, ?)
+    """, (
+        username,
+        action,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+    conn.close()
+
+# ----------------------------
+# REPORT FUNCTIONS
+# ----------------------------
 def save_report(username, answered, dropped, aht):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO reports (username, upload_date, answered, dropped, aht) VALUES (?,?,?,?,?)",
-              (username, datetime.now().strftime("%Y-%m-%d"), answered, dropped, aht))
+    c.execute("""
+        INSERT INTO reports (username, upload_date, answered, dropped, aht)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        username,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        answered,
+        dropped,
+        aht
+    ))
     conn.commit()
     conn.close()
+
+def get_reports():
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM reports")
+    reports = c.fetchall()
+    conn.close()
+    return reports

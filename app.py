@@ -1,186 +1,265 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from io import BytesIO
+
+from database import (
+    init_db,
+    create_user,
+    login_user,
+    get_admins,
+    suspend_admin,
+    activate_admin,
+    delete_admin,
+    reset_password,
+    log_action,
+    save_report,
+    get_reports
+)
+
+from reportlab.platypus import SimpleDocTemplate, Table, Paragraph
 from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from PIL import Image
-import random
-from database import *
-
-st.set_page_config(layout="wide", page_title="Workforce Analytics Dashboard")
+from reportlab.lib.styles import getSampleStyleSheet
 
 # ----------------------------
-# BACKGROUND SLIDESHOW
+# INIT
 # ----------------------------
-bg_images = [
-    "https://images.unsplash.com/photo-1605902711622-cfb43c4430d8?auto=format&fit=crop&w=1600&q=80",
-    "https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1600&q=80",
-    "https://images.unsplash.com/photo-1496307042754-b4aa456c4a2d?auto=format&fit=crop&w=1600&q=80"
-]
-bg_url = random.choice(bg_images)
-st.markdown(f"""
-<style>
-.stApp {{
-background-image: url('{bg_url}');
-background-size: cover;
-background-repeat: no-repeat;
-background-attachment: fixed;
-}}
-.block-container {{
-background: rgba(15,23,42,0.75);
-border-radius: 15px;
-padding: 2rem;
-}}
-.kpi-card {{
-background-color: #1f2937; padding:25px; border-radius:12px; text-align:center; color:white; box-shadow:0px 4px 15px rgba(0,0,0,0.4);
-}}
-.section-title {{color:white; margin-top:30px; margin-bottom:15px;}}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Workforce Dashboard", layout="wide")
+init_db()
 
-# ----------------------------
-# INITIALIZE DATABASE
-# ----------------------------
-create_tables()
-
-# ----------------------------
-# SESSION STATE
-# ----------------------------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+if "username" not in st.session_state:
+    st.session_state.username = ""
+if "role" not in st.session_state:
+    st.session_state.role = ""
 
 # ----------------------------
-# LOGIN / PASSWORD RESET
+# LOGIN
 # ----------------------------
 if not st.session_state.logged_in:
+
     st.title("🔐 Workforce Analytics Platform")
-    menu = ["Login", "Forgot Password"]
-    choice = st.sidebar.selectbox("Menu", menu)
 
-    if choice == "Login":
-        user = st.text_input("Username")
-        pwd = st.text_input("Password", type="password")
-        if st.button("Login"):
-            result = login_user(user, pwd)
-            if result:
-                if result[3] != "Active":
-                    st.error("Your account is suspended. Contact manager.")
-                else:
-                    st.session_state.logged_in = True
-                    st.session_state.username = result[0]
-                    st.session_state.role = result[2]
-                    update_last_login(result[0])
-                    st.experimental_rerun()
-            else:
-                st.error("Invalid credentials")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
 
-    elif choice == "Forgot Password":
-        user = st.text_input("Enter your username")
-        new_pwd = st.text_input("New password", type="password")
-        if st.button("Reset Password"):
-            if reset_password(user, new_pwd):
-                st.success("Password updated successfully")
-            else:
-                st.error("User not found")
+    if st.button("Login"):
+        user = login_user(username, password)
+        if user:
+            st.session_state.logged_in = True
+            st.session_state.username = user[1]
+            st.session_state.role = user[3]
+            st.rerun()
+        else:
+            st.error("Invalid credentials or suspended account.")
 
 # ----------------------------
-# DASHBOARD
+# AFTER LOGIN
 # ----------------------------
-if st.session_state.logged_in:
-    st.title("📊 Workforce Executive Dashboard")
+else:
+
     st.sidebar.write(f"Logged in as: {st.session_state.username}")
     st.sidebar.write(f"Role: {st.session_state.role}")
+
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
-        st.experimental_rerun()
+        st.rerun()
 
-    # ----------------------------
-    # MANAGER: ADMIN MANAGEMENT
-    # ----------------------------
-    if st.session_state.role == "Manager":
-        st.subheader("Manager Controls - Admin Management")
-        st.markdown("### Add Admin")
-        new_admin = st.text_input("Admin Username")
-        new_pwd = st.text_input("Admin Password", type="password")
-        if st.button("Create Admin"):
-            if create_user(new_admin, new_pwd, "Admin", created_by=st.session_state.username):
-                st.success(f"Admin {new_admin} created")
-                st.experimental_rerun()
-            else:
-                st.error("Admin already exists")
-
-        st.markdown("### Remove Admin")
-        admins = get_admins()
-        admin_usernames = [a[0] for a in admins]
-        if admin_usernames:
-            to_remove = st.selectbox("Select admin to remove", admin_usernames)
-            if st.button("Remove Admin"):
-                if remove_admin(to_remove, st.session_state.username):
-                    st.success(f"Admin {to_remove} removed")
-                    st.experimental_rerun()
-                else:
-                    st.error("Cannot remove Admin with reports uploaded")
-        else:
-            st.info("No admins found")
-
-    # ----------------------------
-    # ADMIN: REPORT UPLOAD
-    # ----------------------------
+    # ============================
+    # ADMIN PANEL
+    # ============================
     if st.session_state.role == "Admin":
-        st.subheader("Upload Excel Report")
+
+        st.header("📊 Upload Raw Data Excel (with 3 sheets: Dispositions, Inbound Productivity, Disconnections)")
+
         uploaded_file = st.file_uploader("Upload Excel", type=["xlsx"])
+
         if uploaded_file:
-            df = pd.read_excel(uploaded_file)
-            df.columns = df.columns.str.strip().str.lower()
-            if "date" not in df.columns or "status" not in df.columns:
-                st.error("Excel must contain 'Date' and 'Status'")
-                st.stop()
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"])
-            aht_column = None
-            for col in df.columns:
-                if "aht" in col or "handle" in col:
-                    aht_column = col
-                    break
-            answered = df[df["status"].str.lower() == "answered"].shape[0]
-            dropped = df[df["status"].str.lower() == "unanswered"].shape[0]
-            avg_aht = df[aht_column].mean() if aht_column else 0
+            xls = pd.ExcelFile(uploaded_file)
+            dispositions_df = pd.read_excel(xls, "Dispositions")
+            productivity_df = pd.read_excel(xls, "Inbound Productivity")
+            disconnections_df = pd.read_excel(xls, "Disconnections")
 
-            # Save to DB
-            save_report(st.session_state.username, answered, dropped, avg_aht)
-            st.success("Report processed and saved!")
+            tab1, tab2, tab3 = st.tabs(["📊 Dispositions Usage", "📈 Inbound Productivity", "🔌 Disconnection Rates"])
 
             # ----------------------------
-            # KPI Cards
+            # TAB 1: Dispositions Usage
             # ----------------------------
-            st.subheader("Report Summary")
-            col1, col2, col3 = st.columns(3)
-            col1.markdown(f"<div class='kpi-card'><h3>Answered</h3><h2>{answered}</h2></div>", unsafe_allow_html=True)
-            col2.markdown(f"<div class='kpi-card'><h3>Dropped</h3><h2>{dropped}</h2></div>", unsafe_allow_html=True)
-            col3.markdown(f"<div class='kpi-card'><h3>Average AHT</h3><h2>{round(avg_aht,2)}</h2></div>", unsafe_allow_html=True)
+            with tab1:
+                st.subheader("Dispositioned vs No Disposition (Daily)")
+                daily_stats = dispositions_df.groupby("Date")["Status"].value_counts(normalize=True).unstack().fillna(0)
+                st.dataframe(daily_stats)
 
-            # Pie chart
-            fig1, ax1 = plt.subplots()
-            ax1.pie([answered, dropped], labels=["Answered","Dropped"], autopct="%1.1f%%", colors=['#16a34a','#dc2626'])
-            ax1.axis("equal")
-            st.pyplot(fig1)
+                fig, ax = plt.subplots()
+                daily_stats.plot(kind="line", ax=ax)
+                ax.set_title("Daily Disposition Trends")
+                st.pyplot(fig)
 
-            # Histogram
-            st.subheader("Status Histogram")
-            df['status'].value_counts().plot(kind='bar', color=['#16a34a','#dc2626'])
-            st.pyplot(plt.gcf())
+                st.subheader("Hourly Distribution")
+                hourly_stats = dispositions_df.groupby("Time")["Status"].value_counts(normalize=True).unstack().fillna(0)
+                st.dataframe(hourly_stats)
 
-    # ----------------------------
-    # VIEW REPORTS (All Roles)
-    # ----------------------------
-    st.subheader("Reports Overview")
-    reports_df = get_reports()
-    if reports_df.empty:
-        st.info("No reports yet")
-    else:
-        if st.session_state.role == "Admin":
-            st.dataframe(reports_df)
-        else:
-            st.dataframe(reports_df[["id","username","upload_date","answered","dropped","aht"]])
+                fig2, ax2 = plt.subplots()
+                hourly_stats.plot(kind="bar", stacked=True, ax=ax2)
+                ax2.set_title("Hourly Disposition Distribution")
+                st.pyplot(fig2)
+
+                st.subheader("Management View (Disposition Codes)")
+                code_stats = dispositions_df.groupby("Disposition Code")["Status"].value_counts(normalize=True).unstack().fillna(0)
+                st.dataframe(code_stats)
+
+                # Export Excel/PDF
+                excel_buffer = BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    daily_stats.to_excel(writer, sheet_name="Daily Stats")
+                    hourly_stats.to_excel(writer, sheet_name="Hourly Stats")
+                    code_stats.to_excel(writer, sheet_name="Disposition Codes")
+                st.download_button("Download Dispositions (Excel)", excel_buffer.getvalue(), "dispositions.xlsx")
+
+                pdf_buffer = BytesIO()
+                doc = SimpleDocTemplate(pdf_buffer, pagesize=letter)
+                styles = getSampleStyleSheet()
+                elements = [Paragraph("Dispositions Report", styles['Heading1']), Table(daily_stats.reset_index().values.tolist())]
+                doc.build(elements)
+                st.download_button("Download Dispositions (PDF)", pdf_buffer.getvalue(), "dispositions.pdf")
+
+            # ----------------------------
+            # TAB 2: Inbound Productivity
+            # ----------------------------
+            with tab2:
+                st.subheader("Calls Offered vs Answered")
+                st.dataframe(productivity_df)
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Calls Offered", productivity_df["Calls Offered"].sum())
+                col2.metric("Total Calls Answered", productivity_df["Calls Answered"].sum())
+                col3.metric("Answer %", round(productivity_df["Calls Answered"].sum() / productivity_df["Calls Offered"].sum() * 100, 2))
+
+                fig3, ax3 = plt.subplots()
+                productivity_df.plot(x="Date", y=["Calls Offered", "Calls Answered"], ax=ax3)
+                ax3.set_title("Daily Calls Offered vs Answered")
+                st.pyplot(fig3)
+
+                st.subheader("Hourly AWT & AHT")
+                st.dataframe(productivity_df[["Date", "Avg Wait Time", "Avg Handle Time"]])
+
+                # Export Excel/PDF
+                excel_buffer2 = BytesIO()
+                with pd.ExcelWriter(excel_buffer2, engine="openpyxl") as writer:
+                    productivity_df.to_excel(writer, sheet_name="Productivity")
+                st.download_button("Download Productivity (Excel)", excel_buffer2.getvalue(), "productivity.xlsx")
+
+                pdf_buffer2 = BytesIO()
+                doc2 = SimpleDocTemplate(pdf_buffer2, pagesize=letter)
+                elements2 = [Paragraph("Inbound Productivity Report", styles['Heading1']), Table(productivity_df.head().values.tolist())]
+                doc2.build(elements2)
+                st.download_button("Download Productivity (PDF)", pdf_buffer2.getvalue(), "productivity.pdf")
+
+            # ----------------------------
+            # TAB 3: Disconnection Rates
+            # ----------------------------
+            with tab3:
+                st.subheader("Daily Disconnection Trends")
+                daily_disc = disconnections_df.groupby("Date")["Disconnection By"].value_counts(normalize=True).unstack().fillna(0)
+                st.dataframe(daily_disc)
+
+                fig4, ax4 = plt.subplots()
+                daily_disc.plot(kind="line", ax=ax4)
+                ax4.set_title("Daily Disconnection Rates")
+                st.pyplot(fig4)
+
+                st.subheader("Hourly Distribution")
+                hourly_disc = disconnections_df.groupby("Time")["Disconnection By"].value_counts(normalize=True).unstack().fillna(0)
+                st.dataframe(hourly_disc)
+
+                fig5, ax5 = plt.subplots()
+                hourly_disc.plot(kind="bar", stacked=True, ax=ax5)
+                ax5.set_title("Hourly Disconnection Distribution")
+                st.pyplot(fig5)
+
+                st.subheader("Agent View")
+                agent_disc = disconnections_df.groupby("Agent")["Disconnection By"].value_counts(normalize=True).unstack().fillna(0)
+                st.dataframe(agent_disc)
+
+                # Export Excel/PDF
+                excel_buffer3 = BytesIO()
+                with pd.ExcelWriter(excel_buffer3, engine="openpyxl") as writer:
+                    daily_disc.to_excel(writer, sheet_name="Daily Disconnections")
+                    hourly_disc.to_excel(writer, sheet_name="Hourly Disconnections")
+                    agent_disc.to_excel(writer, sheet_name="Agent Disconnections")
+                st.download_button("Download Disconnections (Excel)", excel_buffer3.getvalue(), "disconnections.xlsx")
+
+                pdf_buffer3 = BytesIO()
+                doc3 = SimpleDocTemplate(pdf_buffer3, pagesize=letter)
+                elements3 = [Paragraph("Disconnection Report", styles['Heading1']), Table(daily_disc.reset_index().values.tolist())]
+                doc3.build(elements3)
+                st.download_button("Download Disconnections (PDF)", pdf_buffer3.getvalue(), "disconnections.pdf")
+
+    # ============================
+    # MANAGER PANEL
+    # ============================
+    elif st.session_state.role == "Manager":
+
+        tab1, tab2 = st.tabs(["📊 Reports", "👥 Manage Admins"])
+
+        with tab1:
+            reports = get_reports()
+            if reports:
+                df = pd.DataFrame(reports, columns=["ID", "Username", "Upload Date", "Answered", "Dropped", "AHT"])
+                st.dataframe(df)
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Reports", df.shape[0])
+                col2.metric("Total Answered", df["Answered"].sum())
+                col3.metric("Overall Avg AHT", round(df["AHT"].mean(), 2))
+
+                st.subheader("AHT Trend")
+                fig, ax = plt.subplots()
+                ax.plot(df["AHT"])
+                ax.set_title("AHT Over Time")
+                st.pyplot(fig)
+
+                buf = BytesIO()
+                fig.savefig(buf, format="png")
+                st.download_button("Download AHT Trend", buf.getvalue(), "aht_trend.png")
+
+                excel_buffer = BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    df.to_excel(writer, index=False, sheet_name="Manager Summary")
+
+                st.download_button(
+                    label="Download Summary Report (Excel)",
+                    data=excel_buffer.getvalue(),
+                    file_name="manager_summary.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                st.info("No reports uploaded yet.")
+
+        # -------- ADMIN MANAGEMENT --------
+        with tab2:
+            admins = get_admins()
+            for admin in admins:
+                st.write(f"{admin[1]} | Status: {admin[6]}")
+                col1, col2, col3 = st.columns(3)
+                if col1.button(f"Suspend {admin[1]}", key=f"s{admin[0]}"):
+                    suspend_admin(admin[0])
+                    st.rerun()
+                if col2.button(f"Activate {admin[1]}", key=f"a{admin[0]}"):
+                    activate_admin(admin[0])
+                    st.rerun()
+                if col3.button(f"Delete {admin[1]}", key=f"d{admin[0]}"):
+                    delete_admin(admin[0])
+                    st.rerun()
+
+            st.markdown("---")
+            new_user = st.text_input("New Admin Username")
+            new_pass = st.text_input("New Admin Password", type="password")
+
+            if st.button("Create Admin"):
+                if create_user(new_user, new_pass, "Admin", st.session_state.username):
+                    st.success("Admin created successfully.")
+                    st.rerun()
+                else:
+                    st.error("Admin already exists or could not be created.")
