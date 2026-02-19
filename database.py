@@ -1,33 +1,36 @@
-import sqlite3
+import psycopg2
+import os
 import hashlib
 from datetime import datetime
 
-DB_PATH = "workforce.db"
+# -----------------------------------
+# DATABASE CONNECTION (PostgreSQL)
+# -----------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ----------------------------
-# CONNECTION
-# ----------------------------
 def get_connection():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    return psycopg2.connect(DATABASE_URL)
 
-# ----------------------------
+
+# -----------------------------------
 # INITIALIZE DATABASE
-# ----------------------------
+# -----------------------------------
 def init_db():
     create_tables()
-    create_default_manager()
+    create_default_users()
 
-# ----------------------------
-# CREATE TABLES
-# ----------------------------
+
+# -----------------------------------
+# CREATE TABLES (PostgreSQL VERSION)
+# -----------------------------------
 def create_tables():
     conn = get_connection()
     c = conn.cursor()
 
-    # USERS
+    # USERS TABLE
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE,
             password TEXT,
             role TEXT,
@@ -37,10 +40,10 @@ def create_tables():
         )
     """)
 
-    # REPORTS
+    # REPORTS TABLE
     c.execute("""
         CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT,
             upload_date TEXT,
             answered INTEGER,
@@ -49,10 +52,10 @@ def create_tables():
         )
     """)
 
-    # LOGS
+    # LOGS TABLE
     c.execute("""
         CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT,
             action TEXT,
             timestamp TEXT
@@ -62,24 +65,29 @@ def create_tables():
     conn.commit()
     conn.close()
 
-# ----------------------------
+
+# -----------------------------------
 # PASSWORD HASHING
-# ----------------------------
+# -----------------------------------
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# ----------------------------
-# DEFAULT MANAGER
-# ----------------------------
-def create_default_manager():
+
+# -----------------------------------
+# CREATE DEFAULT USERS
+# -----------------------------------
+def create_default_users():
     conn = get_connection()
     c = conn.cursor()
 
-    c.execute("SELECT * FROM users WHERE role='Manager'")
-    if not c.fetchone():
+    c.execute("SELECT COUNT(*) FROM users")
+    count = c.fetchone()[0]
+
+    if count == 0:
+        # Manager
         c.execute("""
             INSERT INTO users (username, password, role, created_by, status, last_login)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             "manager",
             hash_password("manager123"),
@@ -88,13 +96,28 @@ def create_default_manager():
             "Active",
             None
         ))
+
+        # Admin
+        c.execute("""
+            INSERT INTO users (username, password, role, created_by, status, last_login)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            "admin",
+            hash_password("admin123"),
+            "Admin",
+            "System",
+            "Active",
+            None
+        ))
+
         conn.commit()
 
     conn.close()
 
-# ----------------------------
+
+# -----------------------------------
 # CREATE USER
-# ----------------------------
+# -----------------------------------
 def create_user(username, password, role, created_by):
     conn = get_connection()
     c = conn.cursor()
@@ -102,7 +125,7 @@ def create_user(username, password, role, created_by):
     try:
         c.execute("""
             INSERT INTO users (username, password, role, created_by, status, last_login)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             username,
             hash_password(password),
@@ -113,19 +136,20 @@ def create_user(username, password, role, created_by):
         ))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
         return False
     finally:
         conn.close()
 
-# ----------------------------
+
+# -----------------------------------
 # LOGIN
-# ----------------------------
+# -----------------------------------
 def login_user(username, password):
     conn = get_connection()
     c = conn.cursor()
 
-    c.execute("SELECT * FROM users WHERE username=?", (username,))
+    c.execute("SELECT * FROM users WHERE username=%s", (username,))
     user = c.fetchone()
 
     if user:
@@ -137,7 +161,7 @@ def login_user(username, password):
 
         if db_password == hash_password(password):
             c.execute(
-                "UPDATE users SET last_login=? WHERE id=?",
+                "UPDATE users SET last_login=%s WHERE id=%s",
                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), id_)
             )
             conn.commit()
@@ -147,9 +171,10 @@ def login_user(username, password):
     conn.close()
     return None
 
-# ----------------------------
+
+# -----------------------------------
 # ADMIN MANAGEMENT
-# ----------------------------
+# -----------------------------------
 def get_admins():
     conn = get_connection()
     c = conn.cursor()
@@ -158,50 +183,55 @@ def get_admins():
     conn.close()
     return admins
 
+
 def suspend_admin(admin_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("UPDATE users SET status='Suspended' WHERE id=?", (admin_id,))
+    c.execute("UPDATE users SET status='Suspended' WHERE id=%s", (admin_id,))
     conn.commit()
     conn.close()
+
 
 def activate_admin(admin_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("UPDATE users SET status='Active' WHERE id=?", (admin_id,))
+    c.execute("UPDATE users SET status='Active' WHERE id=%s", (admin_id,))
     conn.commit()
     conn.close()
+
 
 def delete_admin(admin_id):
     conn = get_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id=?", (admin_id,))
+    c.execute("DELETE FROM users WHERE id=%s", (admin_id,))
     conn.commit()
     conn.close()
     return True
 
-# ----------------------------
+
+# -----------------------------------
 # RESET PASSWORD
-# ----------------------------
+# -----------------------------------
 def reset_password(username, new_password):
     conn = get_connection()
     c = conn.cursor()
     c.execute(
-        "UPDATE users SET password=? WHERE username=?",
+        "UPDATE users SET password=%s WHERE username=%s",
         (hash_password(new_password), username)
     )
     conn.commit()
     conn.close()
 
-# ----------------------------
+
+# -----------------------------------
 # LOG ACTION
-# ----------------------------
+# -----------------------------------
 def log_action(username, action):
     conn = get_connection()
     c = conn.cursor()
     c.execute("""
         INSERT INTO logs (username, action, timestamp)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
     """, (
         username,
         action,
@@ -210,15 +240,16 @@ def log_action(username, action):
     conn.commit()
     conn.close()
 
-# ----------------------------
+
+# -----------------------------------
 # REPORT FUNCTIONS
-# ----------------------------
+# -----------------------------------
 def save_report(username, answered, dropped, aht):
     conn = get_connection()
     c = conn.cursor()
     c.execute("""
         INSERT INTO reports (username, upload_date, answered, dropped, aht)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
     """, (
         username,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -228,6 +259,7 @@ def save_report(username, answered, dropped, aht):
     ))
     conn.commit()
     conn.close()
+
 
 def get_reports():
     conn = get_connection()
